@@ -34,7 +34,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
 from PIL import Image
-from transformers import AutoModel, AutoProcessor
+from transformers import AutoImageProcessor, AutoModel
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -92,6 +92,27 @@ def _load_batch_images(paths: List[str]) -> List[Image.Image]:
 	return [_load_image(path) for path in paths]
 
 
+def _extract_embedding_tensor(output):
+	if torch.is_tensor(output):
+		return output
+
+	if hasattr(output, "image_embeds") and output.image_embeds is not None:
+		return output.image_embeds
+
+	if hasattr(output, "pooler_output") and output.pooler_output is not None:
+		return output.pooler_output
+
+	if hasattr(output, "last_hidden_state") and output.last_hidden_state is not None:
+		return output.last_hidden_state[:, 0]
+
+	if isinstance(output, (tuple, list)) and len(output) > 0:
+		for item in output:
+			if torch.is_tensor(item):
+				return item
+
+	raise ValueError("Could not extract a tensor embedding from model output")
+
+
 def _embed_batch(model, processor, image_paths: List[str], device: torch.device) -> np.ndarray:
 	images = _load_batch_images(image_paths)
 	inputs = processor(images=images, return_tensors="pt")
@@ -99,12 +120,11 @@ def _embed_batch(model, processor, image_paths: List[str], device: torch.device)
 
 	with torch.no_grad():
 		if hasattr(model, "get_image_features"):
-			embeddings = model.get_image_features(**inputs)
+			raw_output = model.get_image_features(**inputs)
 		else:
-			outputs = model(**inputs)
-			embeddings = getattr(outputs, "image_embeds", None)
-			if embeddings is None:
-				embeddings = outputs.last_hidden_state[:, 0]
+			raw_output = model(**inputs)
+
+	embeddings = _extract_embedding_tensor(raw_output)
 
 	embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=-1)
 	return embeddings.detach().cpu().numpy()
@@ -136,14 +156,14 @@ def main() -> None:
 	output_path = Path(args.output_file)
 	output_path.parent.mkdir(parents=True, exist_ok=True)
 
-	dataframe = pd.read_csv(csv_path)
+	dataframe = pd.read_csv(csv_path, low_memory=False)
 	if "FilePath" not in dataframe.columns:
 		raise KeyError("Expected a FilePath column in the input CSV")
 	if args.max_samples is not None:
 		dataframe = dataframe.head(args.max_samples)
 
 	device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-	processor = AutoProcessor.from_pretrained(args.model_id, trust_remote_code=True)
+	processor = AutoImageProcessor.from_pretrained(args.model_id, trust_remote_code=True, use_fast=False)
 	model = AutoModel.from_pretrained(args.model_id, trust_remote_code=True)
 	model.to(device)
 	model.eval()
