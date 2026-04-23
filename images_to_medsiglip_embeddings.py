@@ -1,24 +1,7 @@
 import os
 import sys
 import argparse
-
-
-def _extract_gpu_arg_early(default: str = "0") -> str:
-	"""
-	Extract GPU early, to limit cuda to only one physical ID (for shared servers with multiple GPUs)
-	"""
-	gpu_id = default
-	argv = sys.argv[1:]
-
-	for i, tok in enumerate(argv):
-		if tok == "--gpu" and i + 1 < len(argv):
-			gpu_id = argv[i + 1]
-			break
-		if tok.startswith("--gpu="):
-			gpu_id = tok.split("=", 1)[1]
-			break
-
-	return gpu_id
+from utils.utils import _extract_gpu_arg_early, print_cuda_info
 
 
 _EARLY_GPU_ID = _extract_gpu_arg_early()
@@ -163,6 +146,7 @@ def main() -> None:
 		dataframe = dataframe.head(args.max_samples)
 
 	device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+	print_cuda_info()
 	processor = AutoImageProcessor.from_pretrained(args.model_id, trust_remote_code=True, use_fast=False)
 	model = AutoModel.from_pretrained(args.model_id, trust_remote_code=True)
 	model.to(device)
