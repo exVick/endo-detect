@@ -18,6 +18,7 @@ import pyarrow.parquet as pq
 import torch
 from PIL import Image
 from transformers import AutoImageProcessor, AutoModel
+from tqdm.auto import tqdm
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -161,20 +162,26 @@ def main() -> None:
 	batch_buffer = []
 	batch_index = 0
 
-	for start_idx in range(0, len(dataframe), args.batch_size):
-		batch_index += 1
-		batch = dataframe.iloc[start_idx : start_idx + args.batch_size].copy()
-		image_paths = batch["FilePath"].astype(str).tolist()
-		batch["medsiglip_embedding"] = _embed_batch(model, processor, image_paths, device).tolist()
-		batch_buffer.append(batch)
+	progress_bar = tqdm(total=len(dataframe), desc="Embedding images", unit="img")
+	try:
+		for start_idx in range(0, len(dataframe), args.batch_size):
+			batch_index += 1
+			batch = dataframe.iloc[start_idx : start_idx + args.batch_size].copy()
+			image_paths = batch["FilePath"].astype(str).tolist()
+			batch["medsiglip_embedding"] = _embed_batch(model, processor, image_paths, device).tolist()
+			batch_buffer.append(batch)
 
-		should_save = len(batch_buffer) >= args.save_every or start_idx + args.batch_size >= len(dataframe)
-		if should_save:
-			buffered = pd.concat(batch_buffer, ignore_index=True)
-			chunk_path = chunk_dir / f"batch_{batch_index:06d}.parquet"
-			buffered.to_parquet(chunk_path, index=False)
-			chunk_paths.append(chunk_path)
-			batch_buffer = []
+			progress_bar.update(len(batch))
+
+			should_save = len(batch_buffer) >= args.save_every or start_idx + args.batch_size >= len(dataframe)
+			if should_save:
+				buffered = pd.concat(batch_buffer, ignore_index=True)
+				chunk_path = chunk_dir / f"batch_{batch_index:06d}.parquet"
+				buffered.to_parquet(chunk_path, index=False)
+				chunk_paths.append(chunk_path)
+				batch_buffer = []
+	finally:
+		progress_bar.close()
 
 	_write_chunks_to_parquet(chunk_paths, output_path)
 	shutil.rmtree(chunk_dir, ignore_errors=True)
