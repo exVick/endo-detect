@@ -6,9 +6,9 @@ from utils.utils import (
     print_cuda_info,
     _load_input_file,
     get_gpu_name,
-    get_gpu_memory_mb,
+    get_gpu_memory_gb,
     reset_peak_gpu_memory,
-    get_peak_gpu_memory_mb,
+    get_peak_gpu_memory_gb,
     write_run_stats,
 )
 
@@ -141,7 +141,7 @@ def main() -> None:
     model = AutoModel.from_pretrained(args.model_id, trust_remote_code=True)
     model.to(device)
     model.eval()
-    mem_after_model = get_gpu_memory_mb()
+    mem_after_model = get_gpu_memory_gb()
     reset_peak_gpu_memory()
 
     chunk_dir = output_path.parent / f"{output_path.stem}_chunks"
@@ -183,8 +183,8 @@ def main() -> None:
         "gpu_name": get_gpu_name(),
         "model_id": args.model_id,
         "num_samples": len(dataframe),
-        "memory_after_model_load_mb": mem_after_model,
-        "peak_memory_embedding_mb": get_peak_gpu_memory_mb(),
+        "memory_after_model_load_gb": mem_after_model,
+        "peak_memory_embedding_gb": get_peak_gpu_memory_gb(),
         "runtime_seconds": round(time.time() - t_start, 2),
     })
 

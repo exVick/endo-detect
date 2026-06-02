@@ -46,19 +46,19 @@ def get_gpu_name():
 	return torch.cuda.get_device_name(torch.cuda.current_device())
 
 
-def get_gpu_memory_mb() -> dict:
+def get_gpu_memory_gb() -> dict:
 	"""
-	returns currently allocated and reserved gpu memory in megabytes.
+	returns currently allocated and reserved gpu memory in gigabytes.
 
-	returns a dict with keys allocated_mb and reserved_mb, both None when cuda is unavailable.
+	returns a dict with keys allocated_gb and reserved_gb, both None when cuda is unavailable.
 	"""
 	import torch
 	if not torch.cuda.is_available():
-		return {"allocated_mb": None, "reserved_mb": None}
+		return {"allocated_gb": None, "reserved_gb": None}
 	dev = torch.cuda.current_device()
 	return {
-		"allocated_mb": round(torch.cuda.memory_allocated(dev) / 1024 ** 2, 2),
-		"reserved_mb": round(torch.cuda.memory_reserved(dev) / 1024 ** 2, 2),
+		"allocated_gb": round(torch.cuda.memory_allocated(dev) / 1024 ** 3, 2),
+		"reserved_gb": round(torch.cuda.memory_reserved(dev) / 1024 ** 3, 2),
 	}
 
 
@@ -69,12 +69,12 @@ def reset_peak_gpu_memory() -> None:
 		torch.cuda.reset_peak_memory_stats()
 
 
-def get_peak_gpu_memory_mb():
-	"""returns peak gpu memory allocated since the last reset in megabytes, or None if cuda is unavailable."""
+def get_peak_gpu_memory_gb():
+	"""returns peak gpu memory allocated since the last reset in gigabytes, or None if cuda is unavailable."""
 	import torch
 	if not torch.cuda.is_available():
 		return None
-	return round(torch.cuda.max_memory_allocated() / 1024 ** 2, 2)
+	return round(torch.cuda.max_memory_allocated() / 1024 ** 3, 2)
 
 
 def write_run_stats(output_file, stats: dict) -> None:
