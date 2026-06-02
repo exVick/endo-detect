@@ -1,7 +1,7 @@
 import os
 import sys
 import argparse
-from utils.utils import _extract_gpu_arg_early, print_cuda_info
+from utils.utils import _extract_gpu_arg_early, print_cuda_info, _load_input_file
 
 
 # gpu must be specified before cuda initializes — exit early if missing
@@ -35,21 +35,6 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max_samples", type=int, default=None, help="Optional limit to the first N samples from the input file")
     parser.add_argument("--max_length", type=int, default=512, help="Maximum token sequence length; longer texts are truncated")
     return parser
-
-
-def _load_input_file(path: str) -> pd.DataFrame:
-    """
-    loads a csv or parquet file based on file extension.
-
-    accepts .csv, .tsv, or .parquet files and returns a dataframe.
-    raises ValueError for unsupported formats.
-    """
-    suffix = Path(path).suffix.lower()
-    if suffix == ".parquet":
-        return pd.read_parquet(path)
-    if suffix in {".csv", ".tsv"}:
-        return pd.read_csv(path, low_memory=False)
-    raise ValueError(f"unsupported file format: {suffix!r} — use .csv, .tsv, or .parquet")
 
 
 def _mean_pool(hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
