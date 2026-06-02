@@ -1,7 +1,16 @@
 import os
 import sys
 import argparse
-from utils.utils import _extract_gpu_arg_early, print_cuda_info, _load_input_file
+from utils.utils import (
+    _extract_gpu_arg_early,
+    print_cuda_info,
+    _load_input_file,
+    get_gpu_name,
+    get_gpu_memory_mb,
+    reset_peak_gpu_memory,
+    get_peak_gpu_memory_mb,
+    write_run_stats,
+)
 
 
 # gpu must be specified before cuda initializes — exit early if missing
@@ -11,6 +20,7 @@ if not _EARLY_GPU_ID:
     sys.exit(1)
 os.environ["CUDA_VISIBLE_DEVICES"] = _EARLY_GPU_ID
 
+import time
 from pathlib import Path
 import shutil
 from typing import List
@@ -110,6 +120,8 @@ def _write_chunks_to_parquet(chunk_paths: List[Path], output_file: Path) -> None
 
 
 def main() -> None:
+    t_start = time.time()
+
     parser = _build_parser()
     args = parser.parse_args()
 
@@ -129,6 +141,8 @@ def main() -> None:
     model = AutoModel.from_pretrained(args.model_id, trust_remote_code=True)
     model.to(device)
     model.eval()
+    mem_after_model = get_gpu_memory_mb()
+    reset_peak_gpu_memory()
 
     chunk_dir = output_path.parent / f"{output_path.stem}_chunks"
     if chunk_dir.exists():
@@ -164,6 +178,15 @@ def main() -> None:
 
     _write_chunks_to_parquet(chunk_paths, output_path)
     shutil.rmtree(chunk_dir, ignore_errors=True)
+
+    write_run_stats(output_path, {
+        "gpu_name": get_gpu_name(),
+        "model_id": args.model_id,
+        "num_samples": len(dataframe),
+        "memory_after_model_load_mb": mem_after_model,
+        "peak_memory_embedding_mb": get_peak_gpu_memory_mb(),
+        "runtime_seconds": round(time.time() - t_start, 2),
+    })
 
 
 if __name__ == "__main__":
