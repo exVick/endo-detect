@@ -1,5 +1,7 @@
 import os
 import sys
+import pandas as pd
+from pathlib import Path
 
 
 def _extract_gpu_arg_early(default: str = "0") -> str:
@@ -33,3 +35,18 @@ def print_cuda_info() -> None:
 	else:
 		print("WARNING: No CUDA device available - inference will be very slow or fail.")
 	print()
+
+
+def _load_input_file(path: str) -> pd.DataFrame:
+    """
+    loads a csv or parquet file based on file extension.
+
+    accepts .csv, .tsv, or .parquet files and returns a dataframe.
+    raises ValueError for unsupported formats.
+    """
+    suffix = Path(path).suffix.lower()
+    if suffix == ".parquet":
+        return pd.read_parquet(path)
+    if suffix in {".csv", ".tsv"}:
+        return pd.read_csv(path, low_memory=False)
+    raise ValueError(f"unsupported file format: {suffix!r} — use .csv, .tsv, or .parquet")

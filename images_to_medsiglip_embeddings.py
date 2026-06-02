@@ -1,10 +1,13 @@
 import os
 import sys
 import argparse
-from utils.utils import _extract_gpu_arg_early, print_cuda_info
+from utils.utils import _extract_gpu_arg_early, print_cuda_info, _load_input_file
 
 
 _EARLY_GPU_ID = _extract_gpu_arg_early()
+if not _EARLY_GPU_ID:
+    print("Error: --gpu is required for this script", file=sys.stderr)
+    sys.exit(1)
 os.environ["CUDA_VISIBLE_DEVICES"] = _EARLY_GPU_ID
 
 from pathlib import Path
@@ -22,10 +25,10 @@ from tqdm.auto import tqdm
 
 
 def _build_parser() -> argparse.ArgumentParser:
-	parser = argparse.ArgumentParser(description="Create MedSigLIP embeddings for images listed in a CSV file.")
-	parser.add_argument("--csv_file", type=str, required=True, help="Input CSV file with image paths in FilePath column")
+	parser = argparse.ArgumentParser(description="Create MedSigLIP embeddings for images listed in a CSV or Parquet file.")
+	parser.add_argument("--input_file", type=str, required=True, help="Input CSV or Parquet file with image paths in FilePath column")
 	parser.add_argument("--output_file", type=str, required=True, help="Output parquet file path")
-	parser.add_argument("--gpu", type=str, default=_EARLY_GPU_ID, help="Physical GPU ID")
+	parser.add_argument("--gpu", type=str, required=True, help="Physical GPU ID (required)")
 	parser.add_argument("--model_id", type=str, default="google/medsiglip-448")
 	parser.add_argument("--batch_size", type=int, default=64)
 	parser.add_argument("--save_every", type=int, default=1, help="Save every N batches")
@@ -136,13 +139,13 @@ def main() -> None:
 	parser = _build_parser()
 	args = parser.parse_args()
 
-	csv_path = Path(args.csv_file)
+	input_path = Path(args.input_file)
 	output_path = Path(args.output_file)
 	output_path.parent.mkdir(parents=True, exist_ok=True)
 
-	dataframe = pd.read_csv(csv_path, low_memory=False)
+	dataframe = _load_input_file(str(input_path))
 	if "FilePath" not in dataframe.columns:
-		raise KeyError("Expected a FilePath column in the input CSV")
+		raise KeyError("expected a FilePath column in the input file")
 	if args.max_samples is not None:
 		dataframe = dataframe.head(args.max_samples)
 
