@@ -192,6 +192,7 @@ def main() -> None:
     write_run_stats(output_path, {
         "gpu_name": get_gpu_name(),
         "model_id": args.model_id,
+        "use_8bit": args.use_8bit,
         "num_samples": len(dataframe),
         "memory_after_model_load_gb": mem_after_model,
         "peak_memory_embedding_gb": get_peak_gpu_memory_gb(),
