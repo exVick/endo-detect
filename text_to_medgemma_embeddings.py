@@ -30,7 +30,7 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
-from transformers import AutoTokenizer, AutoModel
+from transformers import AutoTokenizer, AutoModel, BitsAndBytesConfig
 from tqdm.auto import tqdm
 
 
@@ -40,6 +40,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output_file", type=str, required=True, help="Output parquet file path")
     parser.add_argument("--gpu", type=str, required=True, help="Physical GPU ID")
     parser.add_argument("--model_id", type=str, default="google/medgemma-4b-it")
+    parser.add_argument("--use_8bit", action="store_true", help="True if you want to quantize model in 8-bit")
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--save_every", type=int, default=1, help="Save every N batches")
     parser.add_argument("--max_samples", type=int, default=None, help="Optional limit to the first N samples from the input file")
@@ -138,7 +139,16 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print_cuda_info()
     tokenizer = AutoTokenizer.from_pretrained(args.model_id, trust_remote_code=True)
-    model = AutoModel.from_pretrained(args.model_id, trust_remote_code=True)
+
+    quant_config = None
+    if args.use_8bit:
+        quant_config = BitsAndBytesConfig(load_in_8bit=True)
+
+    model = AutoModel.from_pretrained(
+        args.model_id, 
+        trust_remote_code=True,
+        quantization_config=quant_config,
+        )
     model.to(device)
     model.eval()
     mem_after_model = get_gpu_memory_gb()
