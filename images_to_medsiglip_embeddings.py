@@ -246,17 +246,28 @@ def main() -> None:
             try:
                 frames, invert, samples = _load_volume(path)
                 n_frames = int(frames.shape[0])
- 
+
+                # a decoded volume with no frames is treated as a failure rather
+                # than silently skipped, so it is recorded in the error list
+                if n_frames == 0:
+                    raise ValueError("decoded volume contains no frames")
+
                 if args.sample_frames == "middle":
                     frame_indices = [(n_frames - 1) // 2]  # first of the two middle frames when even
                 else:
-                    frame_indices = range(n_frames)
+                    frame_indices = list(range(n_frames))
 
-                for k in frame_indices:
+                # all selected frames are prepared into a local list before the
+                # shared buffers are touched, so a failure partway through a file
+                # leaves no partial rows behind for it
+                prepared = [_prepare_frame(frames[k], invert, samples) for k in frame_indices]
+
+                # the whole file decoded and prepared cleanly, so its frames are committed
+                for k, image in zip(frame_indices, prepared):
                     buf_idx.append(row_index)
                     buf_frame.append(k + 1)    # 1-based
                     buf_total.append(n_frames)
-                    buf_imgs.append(_prepare_frame(frames[k], invert, samples))
+                    buf_imgs.append(image)
                     if len(buf_imgs) >= args.batch_size:
                         flush_batch()
             except Exception as exc:  
