@@ -185,6 +185,14 @@ def main() -> None:
     dataframe = dataframe.reset_index(drop=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # the siglip vision tower contains a single patch-embedding conv, for which no cudnn engine is available 
+    # on some gpu architectures (eg volta / gv100) under the current cudnn build, where the forward pass 
+    # fails with "unable to find an engine to execute this computation"
+    # cudnn is disabled so that this one conv is routed to a native kernel
+    # overall performance is unaffected because the rest of the model is matmul/attention, not convolution
+    torch.backends.cudnn.enabled = False
+
     print_cuda_info()
     processor = AutoImageProcessor.from_pretrained(args.model_id, use_fast=False)
     model = AutoModel.from_pretrained(args.model_id) 
