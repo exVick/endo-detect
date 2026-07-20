@@ -235,7 +235,7 @@ def main() -> None:
         rows = dataframe.iloc[buf_idx].reset_index(drop=True).copy()
         rows["frame_index"] = buf_frame
         rows["n_frames"] = buf_total
-        rows["medsiglip_embedding"] = embeddings.tolist()
+        rows["medsiglip_image_embedding"] = embeddings.tolist()
         batch_buffer.append(rows)
         state["total_embeddings"] += len(rows)
  
