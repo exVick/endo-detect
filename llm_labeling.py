@@ -22,6 +22,7 @@ if not _EARLY_GPU_ID:
     sys.exit(1)
 os.environ["CUDA_VISIBLE_DEVICES"] = _EARLY_GPU_ID
 
+import re
 import time
 from pathlib import Path
 import torch
@@ -46,10 +47,52 @@ def _build_parser() -> argparse.ArgumentParser:
 max_retries=2
 
 
+# the model and processor are held module-wide so they do not have to be
+# threaded through every labelling function
+_BACKEND = None
+
+
+def init_backend(model_id: str) -> None:
+    """
+    loads the model and its processor once and stores them module-wide.
+
+    expects a huggingface model id, loads the weights in bfloat16 onto the
+    visible gpu and patches in the chat template if the processor ships
+    without one. nothing is returned - the objects are read back through
+    get_backend().
+    """
+    global _BACKEND
+
+    model = AutoModelForMultimodalLM.from_pretrained(
+        model_id,
+        dtype=torch.bfloat16,
+        device_map="auto",
+        )
+    model.eval()
+
+    processor = AutoProcessor.from_pretrained(model_id)
+    # some repos ship the template as a separate file instead of in the config
+    if processor.chat_template is None:
+        tpl = hf_hub_download(model_id, "chat_template.jinja")
+        with open(tpl) as f:
+            processor.chat_template = f.read()
+
+    _BACKEND = (model, processor)
+
+
+def get_backend():
+    """returns the (model, processor) pair, raising if it was never loaded."""
+    if _BACKEND is None:
+        raise RuntimeError("backend not initialised - call init_backend first")
+    return _BACKEND
+
+
 def generate_json(
-    system_prompt: str, user_prompt: str, processor, 
+    system_prompt: str, user_prompt: str,
     temperature: float = 1.0, max_new_tokens: int = 512, do_sample: bool = False
     ) -> str:
+
+    model, processor = get_backend()
 
     messages = [
         {"role": "system", "content": system_prompt},
@@ -98,8 +141,8 @@ def _valid_entity_obj(o) -> bool:
             and isinstance(o.get("evidence"), str))
 
 
-def parse_json_with_retry(system_prompt, user_prompt, processor, validator, max_retries=max_retries):
-    raw = generate_json(system_prompt, user_prompt, processor)
+def parse_json_with_retry(system_prompt, user_prompt, validator, max_retries=max_retries):
+    raw = generate_json(system_prompt, user_prompt)
     for attempt in range(max_retries + 1):
         try:
             obj = json.loads(_strip_fences(raw))
@@ -123,11 +166,11 @@ def parse_json_with_retry(system_prompt, user_prompt, processor, validator, max_
 NULL_ENT = {"state": pd.NA, "suspected": pd.NA, "anatomically_na": pd.NA, "evidence": pd.NA}
 
 
-def extract_strategy_a(text, processor):
+def extract_strategy_a(text):
     if not isinstance(text, str) or not text.strip():
         return {f"A_{e}_{k}": v for e in ENTITIES for k, v in NULL_ENT.items()} | {"A_parse_ok": False, "A_n_retries": 0}
     validator = lambda o: isinstance(o, dict) and all(_valid_entity_obj(o.get(e)) for e in ENTITIES)
-    obj, raw, n_ret = parse_json_with_retry(SYSTEM_A, USER_A.format(text=text), processor, validator)
+    obj, raw, n_ret = parse_json_with_retry(SYSTEM_A, USER_A.format(text=text), validator)
     if obj is None:
         return {f"A_{e}_{k}": v for e in ENTITIES for k, v in NULL_ENT.items()} | {
             "A_parse_ok": False, "A_n_retries": n_ret, "A_raw": raw}
@@ -140,14 +183,14 @@ def extract_strategy_a(text, processor):
     return out
 
 
-def extract_strategy_b(text, processor):
+def extract_strategy_b(text):
     out = {}
     if not isinstance(text, str) or not text.strip():
         return {f"B_{e}_{k}": v for e in ENTITIES for k, v in NULL_ENT.items()} | {"B_parse_ok": False, "B_n_retries": 0}
     ok, total_ret = True, 0
     for e in ENTITIES:
         up = USER_B.format(entity_name=e, entity_def=ENTITY_DEFS[e], text=text)
-        obj, raw, n_ret = parse_json_with_retry(SYSTEM_B, up, processor, _valid_entity_obj)
+        obj, raw, n_ret = parse_json_with_retry(SYSTEM_B, up, _valid_entity_obj)
         total_ret += n_ret
         if obj is None:
             ok = False
@@ -166,7 +209,7 @@ KEYS = ["AccessionNumber"]
 METHOD_FNS = {"A": extract_strategy_a, "B": extract_strategy_b}
 
 
-def run_labels_on_reports(main_df, processor, methods=("A", "B"), show_progress=True):
+def run_labels_on_reports(main_df, methods=("A", "B"), show_progress=True):
     unknown = set(methods) - set(METHOD_FNS)
     if unknown:
         raise ValueError(f"unknown methods: {unknown}")
@@ -189,7 +232,7 @@ def run_labels_on_reports(main_df, processor, methods=("A", "B"), show_progress=
         txt = row["clean_report"]
         rec = {}
         for m in methods:
-            rec.update(METHOD_FNS[m](txt, processor))
+            rec.update(METHOD_FNS[m](txt))
         records[grp] = rec
 
     label_df = pd.DataFrame.from_dict(records, orient="index")
@@ -209,27 +252,14 @@ def main() -> None:
     output_path = Path(args.output_file)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print_cuda_info()
 
-    model = AutoModelForMultimodalLM.from_pretrained(
-        args.model_id,
-        dtype=torch.bfloat16,
-        device_map="auto",
-        )
-    model.to(device)
-    model.eval()
+    # model and processor are loaded once into the module-level backend
+    init_backend(args.model_id)
     mem_after_model = get_gpu_memory_gb()
     reset_peak_gpu_memory()
 
-    processor = AutoProcessor.from_pretrained(args.model_id)
-
-    if processor.chat_template is None:
-        tpl = hf_hub_download(args.model_id, "chat_template.jinja")
-        with open(tpl) as f:
-            processor.chat_template = f.read()
-
-    labels_df = run_labels_on_reports(df_clean, processor, methods=(args.label_strategy))
+    labels_df = run_labels_on_reports(df_clean, methods=(args.label_strategy))
 
     labels_df.to_parquet(output_path)
 
