@@ -34,25 +34,20 @@ from tqdm.auto import tqdm
 
 TARGET_SIZE = 448
 CLIP_PERCENTILES = (1.0, 99.0)
-KEY_COLUMNS = ["SOPInstanceUID", "frame_index", "n_frames"]
+REQUIRED_COLUMNS = ["FilePath", "SOPInstanceUID", "frame_index", "SeriesInstanceUID", "AccessionNumber"]
+KEY_COLUMNS = ["input_row", "SOPInstanceUID", "frame_index", "n_frames"]
+MAX_LISTED_FRAME_ERRORS = 500
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Create MedSigLIP embeddings for images listed in a CSV or Parquet file.")
-    parser.add_argument("--input_file", type=str, required=True, help="Input CSV or Parquet file with image paths in FilePath column")
+    parser.add_argument("--input_file", type=str, required=True, help="Input CSV or Parquet frame manifest, one row per 2D frame") 
     parser.add_argument("--output_file", type=str, required=True, help="Output .npy file path; keys are written next to it as <stem>_keys.parquet")
     parser.add_argument("--gpu", type=str, required=True, help="Physical GPU ID (required)")
     parser.add_argument("--model_id", type=str, default="google/medsiglip-448")
     parser.add_argument("--batch_size", type=int, default=64, help="Number of 2D images (frames) per forward pass")
     parser.add_argument("--save_every", type=int, default=1, help="Save every N model batches")
     parser.add_argument("--max_samples", type=int, default=None, help="Optional limit to the first N input rows")
-    parser.add_argument(
-        "--sample_frames",
-        type=str,
-        choices=["middle", "all"],
-        default="all",
-        help="'middle' embeds only the middle frame of each volume; 'all' embeds every frame as a separate row",
-    )
-    return parser 
+    return parser
 
 
 def _is_dicom(path: str) -> bool:
@@ -169,13 +164,44 @@ def _embed_images(model, processor, images: List[Image.Image], device: torch.dev
     return embeddings.detach().cpu().numpy()
 
 
+def _summarize_errors(errors: List[dict]) -> dict:
+    """Collapse per-frame failures into one entry per series, plus a capped flat list.
+
+    One unreadable multi-frame file fails every frame it holds, so the flat list
+    alone would be unreadable; the grouped view keeps that as a single line and
+    names the accession and series to look at.
+    """
+    if not errors:
+        return {"failed_series": [], "failed_frames": [], "failed_frames_truncated": 0}
+
+    frame = pd.DataFrame(errors)
+    grouped: List[dict] = []
+    for (accession, series), rows in frame.groupby(["AccessionNumber", "SeriesInstanceUID"], sort=False):
+        grouped.append({
+            "AccessionNumber": str(accession),
+            "SeriesInstanceUID": str(series),
+            "num_failed_frames": int(len(rows)),
+            "num_files_affected": int(rows["FilePath"].nunique()),
+            "distinct_errors": sorted(set(rows["error"].tolist()))[:5],
+            "example_file": str(rows["FilePath"].iloc[0]),
+        })
+    grouped.sort(key=lambda item: item["num_failed_frames"], reverse=True)
+
+    return {
+        "failed_series": grouped,
+        "failed_frames": errors[:MAX_LISTED_FRAME_ERRORS],
+        "failed_frames_truncated": max(0, len(errors) - MAX_LISTED_FRAME_ERRORS),
+    }
+
+
 def _write_chunks_to_outputs(
     chunk_paths: List[Tuple[Path, Path]], embedding_file: Path, keys_file: Path
 ) -> None:
     """Concatenate the per-batch chunks into one embedding matrix and one key table.
 
-    Row i of the matrix corresponds to row i of the key table, and both preserve
-    the order in which frames were embedded.
+    Frames are embedded grouped by file, so both are finally sorted back into input
+    row order: row i of the matrix is then row i of the input manifest, and row i of
+    the key table always identifies it regardless of what failed.
     """
     if not chunk_paths:
         np.save(embedding_file, np.zeros((0, 0), dtype=np.float32))
@@ -184,6 +210,11 @@ def _write_chunks_to_outputs(
 
     embeddings = np.concatenate([np.load(path) for path, _ in chunk_paths], axis=0)
     keys = pd.concat([pd.read_parquet(path) for _, path in chunk_paths], ignore_index=True)
+
+    order = np.argsort(keys["input_row"].to_numpy(), kind="stable")
+    embeddings = embeddings[order]
+    keys = keys.iloc[order].reset_index(drop=True)
+
     np.save(embedding_file, embeddings.astype(np.float32))
     keys.to_parquet(keys_file, index=False)
 
@@ -200,16 +231,17 @@ def main() -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     dataframe = _load_input_file(str(input_path))
-    if "FilePath" not in dataframe.columns:
-        raise KeyError("expected a FilePath column in the input file")
-    if "SOPInstanceUID" not in dataframe.columns:
-        raise KeyError("expected a SOPInstanceUID column in the input file")
+    for column in REQUIRED_COLUMNS:
+        if column not in dataframe.columns:
+            raise KeyError(f"expected a {column} column in the input file")
     if args.max_samples is not None:
         dataframe = dataframe.head(args.max_samples)
-    # only the identity of each file is needed; every other manifest column stays
-    # in the manifest and is joined back on (SOPInstanceUID, frame_index) later
-    dataframe = dataframe[["FilePath", "SOPInstanceUID"]].reset_index(drop=True)
+    # only the identity of each frame is needed; every other manifest column stays
+    # in the manifest and is joined back on input_row later
+    dataframe = dataframe[REQUIRED_COLUMNS].reset_index(drop=True)
+    dataframe["input_row"] = np.arange(len(dataframe), dtype=np.int64)
     sop_uids = dataframe["SOPInstanceUID"].to_numpy()
+    frame_numbers = dataframe["frame_index"].to_numpy()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -237,9 +269,8 @@ def main() -> None:
     chunk_paths: List[Tuple[Path, Path]] = []
     batch_buffer: List[Tuple[np.ndarray, pd.DataFrame]] = []   # per-model-batch results awaiting a chunk write
 
-    # Image-level buffers, fillesd across volumes until they reach batch_size.
-    buf_idx: List[int] = []
-    buf_frame: List[int] = []
+    # Image-level buffers, filled across volumes until they reach batch_size.
+    buf_row: List[int] = []
     buf_total: List[int] = []
     buf_imgs: List[Image.Image] = []
 
@@ -264,57 +295,73 @@ def main() -> None:
         state["batch_index"] += 1
         embeddings = _embed_images(model, processor, buf_imgs, device)
         keys = pd.DataFrame({
-            "SOPInstanceUID": sop_uids[buf_idx],
-            "frame_index": buf_frame,
+            "input_row": buf_row,
+            "SOPInstanceUID": sop_uids[buf_row],
+            "frame_index": frame_numbers[buf_row],
             "n_frames": buf_total,
         })
         batch_buffer.append((embeddings, keys))
         state["total_embeddings"] += len(keys)
  
-        buf_idx.clear()
-        buf_frame.clear()
+        buf_row.clear()
         buf_total.clear()
         buf_imgs.clear()
 
         if len(batch_buffer) >= args.save_every:
             write_chunk()
 
-    progress = tqdm(total=len(dataframe), desc=f"Embedding ({args.sample_frames})", unit="file")
+    def record_error(record, message: str) -> None:
+        errors.append({
+            "input_row": int(record.input_row),
+            "AccessionNumber": str(record.AccessionNumber),
+            "SeriesInstanceUID": str(record.SeriesInstanceUID),
+            "SOPInstanceUID": str(record.SOPInstanceUID),
+            "frame_index": int(record.frame_index),
+            "FilePath": str(record.FilePath),
+            "error": message,
+        })
+
+    progress = tqdm(total=len(dataframe), desc="Embedding", unit="frame")
     try:
-        for row_index in range(len(dataframe)):
-            path = str(dataframe["FilePath"].iloc[row_index])
+        # grouping by file means a multi-frame instance is read and decoded once,
+        # no matter how many of its frames the manifest asks for
+        for path, group in dataframe.groupby("FilePath", sort=False):
             try:
-                frames, invert, samples = _load_volume(path)
+                frames, invert, samples = _load_volume(str(path))
                 n_frames = int(frames.shape[0])
 
                 # a decoded volume with no frames is treated as a failure rather
                 # than silently skipped, so it is recorded in the error list
                 if n_frames == 0:
                     raise ValueError("decoded volume contains no frames")
-
-                if args.sample_frames == "middle":
-                    frame_indices = [(n_frames - 1) // 2]  # first of the two middle frames when even
-                else:
-                    frame_indices = list(range(n_frames))
-
-                # all selected frames are prepared into a local list before the
-                # shared buffers are touched, so a failure partway through a file
-                # leaves no partial rows behind for it
-                prepared = [_prepare_frame(frames[k], invert, samples) for k in frame_indices]
-
-                # the whole file decoded and prepared cleanly, so its frames are committed
-                for k, image in zip(frame_indices, prepared):
-                    buf_idx.append(row_index)
-                    buf_frame.append(k + 1)    # 1-based
-                    buf_total.append(n_frames)
-                    buf_imgs.append(image)
-                    if len(buf_imgs) >= args.batch_size:
-                        flush_batch()
-            except Exception as exc:  
-                errors.append({"row_index": int(row_index), "FilePath": path, "error": repr(exc)})
-            finally:
-                progress.update(1)
+            except Exception as exc:
+                # the file could not be decoded, so every frame requested from it fails
+                for record in group.itertuples():
+                    record_error(record, repr(exc))
+                progress.update(len(group))
                 progress.set_postfix(embedded=state["total_embeddings"], errors=len(errors))
+                continue
+
+            for record in group.itertuples():
+                try:
+                    frame_number = int(record.frame_index)
+                    # 1-based and bounded, so a stray 0 cannot silently select the
+                    # last frame through negative indexing
+                    if frame_number < 1 or frame_number > n_frames:
+                        raise IndexError(f"frame_index {frame_number} outside 1..{n_frames}")
+                    image = _prepare_frame(frames[frame_number - 1], invert, samples)
+                except Exception as exc:  
+                    record_error(record, repr(exc))
+                    continue
+
+                buf_row.append(int(record.input_row))
+                buf_total.append(n_frames)
+                buf_imgs.append(image)
+                if len(buf_imgs) >= args.batch_size:
+                    flush_batch()
+
+            progress.update(len(group))
+            progress.set_postfix(embedded=state["total_embeddings"], errors=len(errors))
  
         flush_batch()  # final partial model batch
     finally:
@@ -327,14 +374,14 @@ def main() -> None:
     write_run_stats(output_path, {
         "gpu_name": get_gpu_name(),
         "model_id": args.model_id,
-        "sample_frames": args.sample_frames,
         "batch_size": args.batch_size,
         "embedding_file": str(output_path),
         "keys_file": str(keys_path),
-        "num_input_files": len(dataframe),
+        "num_input_frames": len(dataframe),
+        "num_input_files": int(dataframe["FilePath"].nunique()),
         "num_embeddings": state["total_embeddings"],
-        "num_failed_files": len(errors),
-        "failed_files": errors,
+        "num_failed_frames": len(errors),
+        **_summarize_errors(errors),
         "memory_after_model_load_gb": mem_after_model,
         "peak_memory_embedding_gb": get_peak_gpu_memory_gb(),
         "runtime_seconds": round(time.time() - t_start, 2),
