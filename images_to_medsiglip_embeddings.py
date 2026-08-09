@@ -25,8 +25,6 @@ from typing import List, Tuple
 
 import numpy as np
 import pandas as pd
-import pyarrow as pa
-import pyarrow.parquet as pq
 import torch
 import torchvision.transforms.functional as TF
 from torchvision.transforms import InterpolationMode
@@ -35,11 +33,13 @@ from transformers import AutoImageProcessor, AutoModel
 from tqdm.auto import tqdm 
 
 TARGET_SIZE = 448
+CLIP_PERCENTILES = (1.0, 99.0)
+KEY_COLUMNS = ["SOPInstanceUID", "frame_index", "n_frames"]
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Create MedSigLIP embeddings for images listed in a CSV or Parquet file.")
     parser.add_argument("--input_file", type=str, required=True, help="Input CSV or Parquet file with image paths in FilePath column")
-    parser.add_argument("--output_file", type=str, required=True, help="Output parquet file path")
+    parser.add_argument("--output_file", type=str, required=True, help="Output .npy file path; keys are written next to it as <stem>_keys.parquet")
     parser.add_argument("--gpu", type=str, required=True, help="Physical GPU ID (required)")
     parser.add_argument("--model_id", type=str, default="google/medsiglip-448")
     parser.add_argument("--batch_size", type=int, default=64, help="Number of 2D images (frames) per forward pass")
@@ -49,10 +49,26 @@ def _build_parser() -> argparse.ArgumentParser:
         "--sample_frames",
         type=str,
         choices=["middle", "all"],
-        default="middle",
+        default="all",
         help="'middle' embeds only the middle frame of each volume; 'all' embeds every frame as a separate row",
     )
     return parser 
+
+
+def _is_dicom(path: str) -> bool:
+    """Detect DICOM from file content rather than from the filename.
+
+    Some exports name files after a UID component, so Path.suffix reports
+    something like '.30000024050212003631800000258' and a suffix-based test
+    would misroute a valid DICOM to the image loader. The DICM marker at
+    offset 128 is part of the standard file preamble.
+    """
+    try:
+        with open(path, "rb") as handle:
+            return handle.read(132)[128:132] == b"DICM"
+    except OSError:
+        return False
+
 
 def _load_volume(path: str) -> Tuple[np.ndarray, bool, int]:
     """Load one file as a stack with a leading frame axis.
@@ -63,9 +79,7 @@ def _load_volume(path: str) -> Tuple[np.ndarray, bool, int]:
       * invert is True for MONOCHROME1 (display-inverted) DICOMs.
     Frame count comes from the decoded pixel data, not from metadata.
     """
-    suffix = Path(path).suffix.lower()
- 
-    if suffix in {".dcm", ""}:
+    if _is_dicom(path):
         import pydicom
 
         dataset = pydicom.dcmread(path)
@@ -101,19 +115,25 @@ def _load_volume(path: str) -> Tuple[np.ndarray, bool, int]:
 def _prepare_frame(frame: np.ndarray, invert: bool, samples: int) -> Image.Image:
     """Turn one raw frame into a 448x448 RGB uint8 PIL image ready for the processor.
  
-    Grayscale frames are min-max normalized per frame (MR has no absolute scale),
-    then replicated to 3 identical channels. The (-1, 1) normalization is left to
-    the processor, only produce the 0-255 image here.
+    Grayscale frames are windowed to a robust percentile range per frame (MR has no
+    absolute scale), then replicated to 3 identical channels. The (-1, 1) normalization
+    is left to the processor, only produce the 0-255 image here.
     """
     f = np.nan_to_num(frame.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
 
     if samples == 1:
         if invert:
             f = f.max() - f
-        f = f - f.min()
-        fmax = f.max()
-        if fmax > 0:
-            f = f / fmax
+        # percentile window instead of raw min-max: a single hot voxel or a noisy
+        # edge slice would otherwise set the scale for the whole frame, so the same
+        # tissue lands at different intensities across slices of one volume
+        low, high = np.percentile(f, CLIP_PERCENTILES)
+        if high <= low:                    # near-flat frame, fall back to full range
+            low, high = float(f.min()), float(f.max())
+        f = np.clip(f, low, high) - low
+        span = float(high - low)
+        if span > 0:
+            f = f / span
         f8 = (f * 255.0).clip(0, 255).astype(np.uint8)
         f8 = np.repeat(f8[:, :, None], 3, axis=2)          # (H, W, 3)
     else:
@@ -149,22 +169,23 @@ def _embed_images(model, processor, images: List[Image.Image], device: torch.dev
     return embeddings.detach().cpu().numpy()
 
 
-def _write_chunks_to_parquet(chunk_paths: List[Path], output_file: Path) -> None:
+def _write_chunks_to_outputs(
+    chunk_paths: List[Tuple[Path, Path]], embedding_file: Path, keys_file: Path
+) -> None:
+    """Concatenate the per-batch chunks into one embedding matrix and one key table.
+
+    Row i of the matrix corresponds to row i of the key table, and both preserve
+    the order in which frames were embedded.
+    """
     if not chunk_paths:
-        empty_table = pa.Table.from_pandas(pd.DataFrame())
-        pq.write_table(empty_table, output_file)
+        np.save(embedding_file, np.zeros((0, 0), dtype=np.float32))
+        pd.DataFrame(columns=KEY_COLUMNS).to_parquet(keys_file, index=False)
         return
 
-    writer = None
-    try:
-        for chunk_path in chunk_paths:
-            table = pq.read_table(chunk_path)
-            if writer is None:
-                writer = pq.ParquetWriter(output_file, table.schema)
-            writer.write_table(table)
-    finally:
-        if writer is not None:
-            writer.close()
+    embeddings = np.concatenate([np.load(path) for path, _ in chunk_paths], axis=0)
+    keys = pd.concat([pd.read_parquet(path) for _, path in chunk_paths], ignore_index=True)
+    np.save(embedding_file, embeddings.astype(np.float32))
+    keys.to_parquet(keys_file, index=False)
 
 
 def main() -> None:
@@ -174,15 +195,21 @@ def main() -> None:
     args = parser.parse_args()
 
     input_path = Path(args.input_file)
-    output_path = Path(args.output_file)
+    output_path = Path(args.output_file).with_suffix(".npy")
+    keys_path = output_path.with_name(f"{output_path.stem}_keys.parquet")
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     dataframe = _load_input_file(str(input_path))
     if "FilePath" not in dataframe.columns:
         raise KeyError("expected a FilePath column in the input file")
+    if "SOPInstanceUID" not in dataframe.columns:
+        raise KeyError("expected a SOPInstanceUID column in the input file")
     if args.max_samples is not None:
         dataframe = dataframe.head(args.max_samples)
-    dataframe = dataframe.reset_index(drop=True)
+    # only the identity of each file is needed; every other manifest column stays
+    # in the manifest and is joined back on (SOPInstanceUID, frame_index) later
+    dataframe = dataframe[["FilePath", "SOPInstanceUID"]].reset_index(drop=True)
+    sop_uids = dataframe["SOPInstanceUID"].to_numpy()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -207,10 +234,10 @@ def main() -> None:
     chunk_dir.mkdir(parents=True, exist_ok=True)
 
     errors: List[dict] = []
-    chunk_paths: List[Path] = []
-    batch_buffer: List[pd.DataFrame] = []   # per-model-batch frames awaiting a chunk write
+    chunk_paths: List[Tuple[Path, Path]] = []
+    batch_buffer: List[Tuple[np.ndarray, pd.DataFrame]] = []   # per-model-batch results awaiting a chunk write
 
-    # Image-level buffers, filled across volumes until they reach batch_size.
+    # Image-level buffers, fillesd across volumes until they reach batch_size.
     buf_idx: List[int] = []
     buf_frame: List[int] = []
     buf_total: List[int] = []
@@ -221,10 +248,14 @@ def main() -> None:
     def write_chunk() -> None:
         if not batch_buffer:
             return
-        buffered = pd.concat(batch_buffer, ignore_index=True)
-        chunk_path = chunk_dir / f"batch_{len(chunk_paths) + 1:06d}.parquet"
-        buffered.to_parquet(chunk_path, index=False)
-        chunk_paths.append(chunk_path)
+        embeddings = np.concatenate([item[0] for item in batch_buffer], axis=0)
+        keys = pd.concat([item[1] for item in batch_buffer], ignore_index=True)
+        stem = f"batch_{len(chunk_paths) + 1:06d}"
+        embedding_chunk = chunk_dir / f"{stem}.npy"
+        keys_chunk = chunk_dir / f"{stem}.parquet"
+        np.save(embedding_chunk, embeddings.astype(np.float32))
+        keys.to_parquet(keys_chunk, index=False)
+        chunk_paths.append((embedding_chunk, keys_chunk))
         batch_buffer.clear()
  
     def flush_batch() -> None:
@@ -232,12 +263,13 @@ def main() -> None:
             return
         state["batch_index"] += 1
         embeddings = _embed_images(model, processor, buf_imgs, device)
-        rows = dataframe.iloc[buf_idx].reset_index(drop=True).copy()
-        rows["frame_index"] = buf_frame
-        rows["n_frames"] = buf_total
-        rows["medsiglip_image_embedding"] = embeddings.tolist()
-        batch_buffer.append(rows)
-        state["total_embeddings"] += len(rows)
+        keys = pd.DataFrame({
+            "SOPInstanceUID": sop_uids[buf_idx],
+            "frame_index": buf_frame,
+            "n_frames": buf_total,
+        })
+        batch_buffer.append((embeddings, keys))
+        state["total_embeddings"] += len(keys)
  
         buf_idx.clear()
         buf_frame.clear()
@@ -289,7 +321,7 @@ def main() -> None:
         progress.close()
  
     write_chunk()  # write any batches still buffered below save_every
-    _write_chunks_to_parquet(chunk_paths, output_path)
+    _write_chunks_to_outputs(chunk_paths, output_path, keys_path)
     shutil.rmtree(chunk_dir, ignore_errors=True)
  
     write_run_stats(output_path, {
@@ -297,6 +329,8 @@ def main() -> None:
         "model_id": args.model_id,
         "sample_frames": args.sample_frames,
         "batch_size": args.batch_size,
+        "embedding_file": str(output_path),
+        "keys_file": str(keys_path),
         "num_input_files": len(dataframe),
         "num_embeddings": state["total_embeddings"],
         "num_failed_files": len(errors),
@@ -309,4 +343,3 @@ def main() -> None:
  
 if __name__ == "__main__":
     main()
- 
