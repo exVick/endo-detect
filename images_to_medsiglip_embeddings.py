@@ -119,9 +119,10 @@ def _prepare_frame(frame: np.ndarray, invert: bool, samples: int) -> Image.Image
     if samples == 1:
         if invert:
             f = f.max() - f
-        # percentile window instead of raw min-max: a single hot voxel or a noisy
-        # edge slice would otherwise set the scale for the whole frame, so the same
-        # tissue lands at different intensities across slices of one volume
+        # percentile window instead of raw min-max: a single hot pixel would otherwise
+        # set the scale and compress the rest of the frame into a few gray levels, and
+        # slices with and without such outliers would map the same tissue to very
+        # different intensities
         low, high = np.percentile(f, CLIP_PERCENTILES)
         if high <= low:                    # near-flat frame, fall back to full range
             low, high = float(f.min()), float(f.max())
@@ -144,7 +145,7 @@ def _prepare_frame(frame: np.ndarray, invert: bool, samples: int) -> Image.Image
         [TARGET_SIZE, TARGET_SIZE],
         interpolation=InterpolationMode.BILINEAR,
         antialias=False,
-    )                                           # (H, W, 3)
+    )                                           # (3, 448, 448)
     resized = tensor.round().clamp(0, 255).permute(1, 2, 0).contiguous().numpy().astype(np.uint8)
     return Image.fromarray(resized)
 
@@ -200,8 +201,9 @@ def _write_chunks_to_outputs(
     """Concatenate the per-batch chunks into one embedding matrix and one key table.
 
     Frames are embedded grouped by file, so both are finally sorted back into input
-    row order: row i of the matrix is then row i of the input manifest, and row i of
-    the key table always identifies it regardless of what failed.
+    row order. Failed frames have no row, so row i of the matrix matches row i of the
+    input manifest only when nothing failed; row i of the key table always identifies
+    it, so join on its input_row column.
     """
     if not chunk_paths:
         np.save(embedding_file, np.zeros((0, 0), dtype=np.float32))
@@ -249,7 +251,7 @@ def main() -> None:
     # on some gpu architectures (eg volta / gv100) under the current cudnn build, where the forward pass 
     # fails with "unable to find an engine to execute this computation"
     # cudnn is disabled so that this one conv is routed to a native kernel
-    # overall performance is unaffected because the rest of the model is matmul/attention, not convolution
+    # the slowdown is negligible because the rest of the model is matmul/attention, not convolution
     torch.backends.cudnn.enabled = False
 
     print_cuda_info()
