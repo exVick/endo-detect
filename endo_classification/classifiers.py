@@ -24,17 +24,14 @@ Every entry point of :mod:`evaluate` takes ``classifier`` and ``clf_kw``::
     run_inner(reps, labels, splits)                       # logistic, unchanged
     run_inner(reps, labels, splits, classifier="mlp")
     run_inner(reps, labels, splits, classifier="mlp",
-              clf_kw={"hidden": 32, "steps": 600})
+              clf_kw={"hidden": 32, "steps": 600, "weight_decay": 1e-2})
 
-`C` keeps its meaning for both. For the logistic probe it is the inverse L2
-strength sklearn expects. For the perceptron it is mapped onto the weight decay
-of the optimiser, so a sweep over :data:`~.evaluate.C_GRID` remains a
-regularisation sweep and the plots and paired tests that read the "C" column go
-on working unchanged.
+`C` is the logistic probe's inverse L2 strength and is ignored by the
+perceptron, which is regularised through its own `weight_decay`, passed in
+`clf_kw`.
 
 Module constants:
     CLASSIFIERS: The classifier names accepted by :func:`make_classifier`.
-    ACTIVATIONS: The activation names accepted by :class:`MLP`.
 """
 from __future__ import annotations
 
@@ -48,7 +45,6 @@ from sklearn.preprocessing import StandardScaler
 from ._torch_utils import _check_deterministic, _deterministic
 
 CLASSIFIERS = ("logreg", "mlp")
-ACTIVATIONS = ("tanh", "relu", "gelu")
 
 
 # --------------------------------------------------------------------------
@@ -57,9 +53,6 @@ ACTIVATIONS = ("tanh", "relu", "gelu")
 
 class LogReg:
     """Standardisation followed by an L2-penalised logistic regression.
-
-    This is the classifier every result in the project was produced with, kept
-    unchanged so that earlier experiments reproduce exactly.
 
     Attributes:
         name (str): Identifier written into every result row.
@@ -121,7 +114,7 @@ class LogReg:
 # --------------------------------------------------------------------------
 
 class _MLPNet(nn.Module):
-    """Two-layer perceptron producing a single logit.
+    """Two-layer `tanh` perceptron producing a single logit.
 
     The output layer is initialised to zero, so at initialisation the network
     returns zero for every row. That is exactly the chance classifier, which is
@@ -131,40 +124,31 @@ class _MLPNet(nn.Module):
     the output layer, since the gradient reaching the hidden layer is zero while
     the output weights are; from the second step onwards both layers learn.
 
-    The hidden layer is initialised to match its activation: Xavier for the
-    bounded `tanh`, He for the unbounded rectifiers.
+    The hidden layer uses Xavier initialisation, which suits the bounded
+    `tanh`.
 
     Attributes:
         fc1 (torch.nn.Linear): Hidden layer.
         fc2 (torch.nn.Linear): Output layer, initialised to zero.
     """
 
-    def __init__(self, d_in, hidden, activation, dropout):
+    def __init__(self, d_in, hidden, dropout):
         """Build the layers and initialise them.
 
         Args:
             d_in (int): Width of the standardised input.
             hidden (int): Width of the hidden layer.
-            activation (str): One of :data:`ACTIVATIONS`.
             dropout (float): Dropout probability applied to the hidden
                 activations. Zero disables it entirely.
         """
         super().__init__()
         self.fc1 = nn.Linear(d_in, hidden)
         self.fc2 = nn.Linear(hidden, 1)
-        self.act = {"tanh": torch.tanh,
-                    "relu": torch.relu,
-                    "gelu": nn.functional.gelu}[activation]
         self.drop = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
-        if activation == "tanh":
-            # xavier keeps the variance of the activations stable through a
-            # saturating nonlinearity, which he init would overshoot
-            nn.init.xavier_normal_(self.fc1.weight)
-        else:
-            # gelu is close enough to relu for the same gain to apply
-            nn.init.kaiming_normal_(self.fc1.weight, mode="fan_in",
-                                    nonlinearity="relu")
+        # xavier keeps the variance of the activations stable through a
+        # saturating nonlinearity, which he init would overshoot
+        nn.init.xavier_normal_(self.fc1.weight)
         nn.init.zeros_(self.fc1.bias)
         nn.init.zeros_(self.fc2.weight)   # start at the chance classifier
         nn.init.zeros_(self.fc2.bias)
@@ -178,7 +162,7 @@ class _MLPNet(nn.Module):
         Returns:
             torch.Tensor: Logits of shape (n,).
         """
-        return self.fc2(self.drop(self.act(self.fc1(x)))).squeeze(-1)
+        return self.fc2(self.drop(torch.tanh(self.fc1(x)))).squeeze(-1)
 
 
 class MLP:
@@ -186,11 +170,11 @@ class MLP:
 
     The input is whatever a representation produced, standardised, so it is
     roughly zero-mean and unit-variance with a width in the hundreds or
-    thousands and only a few hundred rows. `tanh` is the default activation for
-    that regime: it is bounded, which regularises implicitly where the rows are
-    few, and it cannot produce the dead units a rectifier can under full-batch
-    training, which would otherwise make the result unnecessarily sensitive to
-    the seed.
+    thousands and only a few hundred rows. The activation is fixed to `tanh`,
+    which suits that regime: it is bounded, which regularises implicitly where
+    the rows are few, and it cannot produce the dead units a rectifier can under
+    full-batch training, which would otherwise make the result unnecessarily
+    sensitive to the seed.
 
     Training is full batch, so no shuffling is involved and the only randomness
     is the initialisation, and optionally dropout. Both are drawn under a fixed
@@ -213,29 +197,21 @@ class MLP:
 
     name = "mlp"
 
-    def __init__(self, C, hidden=16, steps=300, lr=1e-3, activation="tanh",
-                 dropout=0.0, weight_decay=None, seed=0, device="cpu",
-                 deterministic=True, threads=1):
+    def __init__(self, hidden=16, steps=300, lr=1e-3, dropout=0.0,
+                 weight_decay=1e-2, seed=0, device="cpu", deterministic=True,
+                 threads=1):
         """Record the hyperparameters. Nothing is fitted yet.
 
         Args:
-            C (float): Inverse regularisation strength, mapped onto the weight
-                decay of the optimiser as described under `weight_decay`.
             hidden (int): Width of the hidden layer. Kept small by default,
                 since the number of accessions is in the hundreds.
             steps (int): Number of full-batch optimiser steps per fit.
             lr (float): AdamW learning rate.
-            activation (str): One of :data:`ACTIVATIONS`.
             dropout (float): Dropout probability on the hidden activations.
-            weight_decay (float, optional): AdamW weight decay, applied to
-                non-bias parameters. When None it is derived from `C` as
-                ``1 / (C * n_train)``. That is the value which matches what
-                sklearn's `C` does: its objective is ``0.5||w||^2 + C * sum of
-                losses``, which is ``mean loss + ||w||^2 / (2 * C * n)`` once
-                divided through, so the two penalise the weights comparably and
-                a sweep over `C` means the same thing for both classifiers.
-                Passing a value here overrides that mapping, after which `C` is
-                still recorded but no longer affects the fit.
+            weight_decay (float): AdamW decoupled weight decay, applied to the
+                non-bias parameters only; biases are excluded. PyTorch scales
+                it by the learning rate, so each step shrinks the weights by a
+                factor of ``(1 - lr * weight_decay)``.
             seed (int): Seed for the initialisation and for dropout. Held fixed
                 across every fit.
             device (str): Device to train on, for example "cpu" or "cuda". The
@@ -248,18 +224,10 @@ class MLP:
             threads (int): Torch thread count to use during a fit, restored
                 afterwards. One by default, so that parallel workers do not each
                 spawn a full thread pool and thrash.
-
-        Raises:
-            ValueError: If `activation` is not one of :data:`ACTIVATIONS`.
         """
-        if activation not in ACTIVATIONS:
-            raise ValueError(f"unknown activation {activation!r}; expected one "
-                             f"of {list(ACTIVATIONS)}")
-        self.C = C
         self.hidden = hidden
         self.steps = steps
         self.lr = lr
-        self.activation = activation
         self.dropout = dropout
         self.weight_decay = weight_decay
         self.seed = seed
@@ -268,10 +236,8 @@ class MLP:
         self.threads = threads
 
         self.meta = {"clf_hidden": hidden, "clf_steps": steps, "clf_lr": lr,
-                     "clf_activation": activation, "clf_dropout": dropout,
+                     "clf_dropout": dropout, "clf_weight_decay": weight_decay,
                      "clf_seed": seed}
-        if weight_decay is not None:
-            self.meta["clf_weight_decay"] = weight_decay
 
         self.net_ = None
         self.scaler_ = None
@@ -322,8 +288,7 @@ class MLP:
         n_neg = float(len(y) - n_pos)
         pw = n_neg / n_pos if n_pos > 0 and n_neg > 0 else 1.0
 
-        wd = (self.weight_decay if self.weight_decay is not None
-              else 1.0 / (float(self.C) * max(len(y), 1)))
+        wd = self.weight_decay
 
         Xt = torch.as_tensor(Xs, device=dev)
         yt = torch.as_tensor(y, dtype=torch.float32, device=dev)
@@ -336,8 +301,7 @@ class MLP:
             # state is left exactly as it was found
             with torch.random.fork_rng(devices=self._fork_devices(dev)):
                 torch.manual_seed(self.seed)
-                net = _MLPNet(Xs.shape[1], self.hidden, self.activation,
-                              self.dropout).to(dev)
+                net = _MLPNet(Xs.shape[1], self.hidden, self.dropout).to(dev)
 
                 # biases are excluded from weight decay, matching AttentionPool
                 decay, no_decay = [], []
@@ -395,8 +359,8 @@ def make_classifier(C, classifier="logreg", clf_kw=None):
     """Build the classifier every function in :mod:`evaluate` fits.
 
     Args:
-        C (float): Inverse regularisation strength, interpreted by whichever
-            classifier is selected.
+        C (float): Inverse L2 regularisation strength. Used by "logreg" only
+            and ignored for "mlp", which takes `weight_decay` in `clf_kw`.
         classifier (str): One of :data:`CLASSIFIERS`.
         clf_kw (dict, optional): Extra hyperparameters forwarded to the chosen
             classifier, for example ``{"steps": 600, "hidden": 32}``. Ignored
@@ -416,6 +380,6 @@ def make_classifier(C, classifier="logreg", clf_kw=None):
                          f"{list(CLASSIFIERS)}")
     cls = {"logreg": LogReg, "mlp": MLP}[classifier]
     try:
-        return cls(C=C, **kw)
+        return cls(C=C, **kw) if classifier == "logreg" else cls(**kw)
     except TypeError as e:
         raise ValueError(f"bad clf_kw for classifier {classifier!r}: {e}") from e

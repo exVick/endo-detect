@@ -8,7 +8,9 @@ Two classifiers are available, selected with ``classifier="logreg"`` (the
 default, and what every earlier result was produced with) or
 ``classifier="mlp"``, with ``clf_kw`` carrying the chosen one's hyperparameters.
 Both standardise their input and weight the classes so that zero is the balanced
-threshold; see :mod:`classifiers`. `C` is a regularisation strength for either.
+threshold; see :mod:`classifiers`. `C` is the logistic probe's inverse L2
+strength and is ignored by the perceptron, which takes `weight_decay` in
+`clf_kw` instead.
 
 Four levels of analysis are provided:
 
@@ -154,7 +156,7 @@ def _clf(C, classifier="logreg", clf_kw=None):
     evaluation code has a single place where a classifier comes into being.
 
     Args:
-        C (float): Inverse regularisation strength.
+        C (float): Inverse regularisation strength. Logistic probe only.
         classifier (str): One of :data:`~.classifiers.CLASSIFIERS`.
         clf_kw (dict, optional): Extra hyperparameters for that classifier.
 
@@ -241,7 +243,8 @@ def run_grid(rep, labels, splits, Cs=(C_HEADLINE,), conditions=CONDITIONS,
         labels (Labels): Labels and masks.
         splits (Sequence[dict]): Splits carrying "seed", "train" and "test".
         Cs (Sequence[float]): Inverse regularisation strengths. Pass a single
-            value for a headline result, or a grid to sweep.
+            value for a headline result, or a grid to sweep. Applies to the
+            logistic probe only; the perceptron ignores it.
         conditions (Sequence[str]): Conditions to evaluate.
         pbar (tqdm.tqdm, optional): Progress bar owned by the caller, advanced
             once per (split, condition). Lets :func:`run_many` drive a single
@@ -252,7 +255,8 @@ def run_grid(rep, labels, splits, Cs=(C_HEADLINE,), conditions=CONDITIONS,
 
     Returns:
         pandas.DataFrame: One row per (split, condition, C), carrying
-        "representation", "seed", "condition", "C", "classifier", the entries of
+        "representation", "seed", "condition", "C" (NaN for the perceptron,
+        which does not use it), "classifier", the entries of
         ``rep.meta`` and of the classifier's `meta`, and the metrics returned by
         :func:`_fit_eval`.
     """
@@ -276,7 +280,8 @@ def run_grid(rep, labels, splits, Cs=(C_HEADLINE,), conditions=CONDITIONS,
                     # carried over between fits
                     clf = _clf(C, classifier, clf_kw)
                     rows.append({"representation": rep.name, "seed": sp["seed"],
-                                 "condition": c, "C": float(C),
+                                 "condition": c,
+                                 "C": float(C) if classifier == "logreg" else np.nan,
                                  "classifier": clf.name,
                                  **rep.meta, **clf.meta,
                                  **_fit_eval(Xtr, ytr, Xte, yte, clf)})
@@ -297,7 +302,8 @@ def run_many(reps, labels, splits, Cs=(C_HEADLINE,), conditions=CONDITIONS,
         reps (Sequence[Representation]): Representations to evaluate.
         labels (Labels): Labels and masks.
         splits (Sequence[dict]): Splits carrying "seed", "train" and "test".
-        Cs (Sequence[float]): Inverse regularisation strengths.
+        Cs (Sequence[float]): Inverse regularisation strengths. Logistic probe
+            only.
         conditions (Sequence[str]): Conditions to evaluate.
         progress (bool): Whether to display the progress bar. Set to False when
             this function is itself called inside a loop.
@@ -456,7 +462,7 @@ def _median_metric(rep, labels, splits, cond, C, y_override=None, cache=None,
         labels (Labels): Labels and masks.
         splits (Sequence[dict]): Splits carrying "train" and "test".
         cond (str): Condition name.
-        C (float): Inverse regularisation strength.
+        C (float): Inverse regularisation strength. Logistic probe only.
         y_override (dict, optional): Maps accession to a replacement label. Used
             to evaluate a permuted labelling without rebuilding `labels`. The
             masks are untouched, so the same accessions stay usable.
@@ -511,7 +517,7 @@ def _one_perm(rep, labels, splits, cond, C, acc_sub, y_sub, buckets, seed,
         labels (Labels): Labels and masks.
         splits (Sequence[dict]): Splits carrying "train" and "test".
         cond (str): Condition name.
-        C (float): Inverse regularisation strength.
+        C (float): Inverse regularisation strength. Logistic probe only.
         acc_sub (numpy.ndarray): Accessions taking part in the permutation.
         y_sub (numpy.ndarray): Their observed labels.
         buckets (dict): Output of :func:`_blocks`.
@@ -553,7 +559,7 @@ def permutation_test(rep, labels, splits, C=C_HEADLINE, n_perm=1000,
         rep (Representation): Representation to test.
         labels (Labels): Labels and masks.
         splits (Sequence[dict]): Splits carrying "seed", "train" and "test".
-        C (float): Inverse regularisation strength.
+        C (float): Inverse regularisation strength. Logistic probe only.
         n_perm (int): Number of permutations. The smallest reportable p-value is
             ``1 / (n_perm + 1)``, so this sets the resolution of the test.
         seed (int): Base seed. Combined with the condition name to give each
@@ -684,7 +690,7 @@ def held_out_scores(rep, labels, splits, cond, C=C_HEADLINE,
         labels (Labels): Labels and masks.
         splits (Sequence[dict]): Splits carrying "train" and "test".
         cond (str): Condition name.
-        C (float): Inverse regularisation strength.
+        C (float): Inverse regularisation strength. Logistic probe only.
         classifier (str): One of :data:`~.classifiers.CLASSIFIERS`.
         clf_kw (dict, optional): Extra hyperparameters for that classifier.
 
@@ -810,7 +816,7 @@ def inner_cv_scores(rep, labels, split, cond, C=C_HEADLINE, k=5,
         labels (Labels): Labels and masks.
         split (dict): One outer split. Only its "train" portion is read.
         cond (str): Condition name.
-        C (float): Inverse regularisation strength.
+        C (float): Inverse regularisation strength. Logistic probe only.
         k (int): Number of inner folds.
         n_repeats (int): Number of times the fold assignment is redrawn.
         seed (int): Base seed. Combined with the condition, the representation
@@ -892,7 +898,7 @@ def run_inner(reps, labels, splits, conditions=CONDITIONS, C=C_HEADLINE,
         splits (Sequence[dict]): Outer splits. Only their "train" portions are
             read.
         conditions (Sequence[str]): Conditions to evaluate.
-        C (float): Inverse regularisation strength.
+        C (float): Inverse regularisation strength. Logistic probe only.
         k (int): Number of inner folds.
         n_repeats (int): Number of times the fold assignment is redrawn.
         seed (int): Base seed for the fold assignments.

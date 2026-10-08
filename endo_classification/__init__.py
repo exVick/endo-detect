@@ -1,6 +1,6 @@
 from .train_test_split import (CONDITIONS, build_accession_table, make_split,
                                describe_split)
-from .classifiers import (CLASSIFIERS, ACTIVATIONS, LogReg, MLP,
+from .classifiers import (CLASSIFIERS, LogReg, MLP,
                           make_classifier)
 from .representations import (Representation, MeanPool, SeriesPool,
                               SeriesBalancedPool, TopKPool,
@@ -17,7 +17,7 @@ from .plots import (plot_grid, plot_null, plot_representations,
 
 __all__ = [
     "CONDITIONS", "build_accession_table", "make_split", "describe_split",
-    "CLASSIFIERS", "ACTIVATIONS", "LogReg", "MLP", "make_classifier",
+    "CLASSIFIERS", "LogReg", "MLP", "make_classifier",
     "Representation", "MeanPool", "SeriesPool", "SeriesBalancedPool", "TopKPool",
     "ProbeRanker", "CentroidRanker", "CentralityRanker", "per_series",
     "AttentionPool", "SERIES_MAP", "peak_memory",
