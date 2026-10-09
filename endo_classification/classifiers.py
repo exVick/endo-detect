@@ -186,13 +186,24 @@ class MLP:
     per draw would fold initialisation noise into the null and inflate the
     p-value.
 
+    Several step counts can be evaluated from a single run. Passing a sequence
+    as `steps` trains once up to the largest value and, through
+    :meth:`fit_path`, exposes the model at every smaller value on the way. The
+    optimiser state and the RNG state are carried across those pauses, so the
+    model at each checkpoint is bit-for-bit the one a separate fit with that
+    many steps would produce.
+
     Attributes:
         name (str): Identifier written into every result row.
         meta (dict): Hyperparameters emitted as extra result columns, prefixed
             "clf_" so they never collide with a representation's own `meta`.
             Group by them to compare settings, for example
             ``summarise_inner(inner, by=("representation", "condition",
-            "clf_steps"))``.
+            "clf_steps"))``. "clf_steps" holds the largest step count, which
+            is what :meth:`fit` trains for; :mod:`evaluate` overwrites it per
+            checkpoint.
+        checkpoints (tuple[int]): The step counts in `steps`, sorted and
+            deduplicated.
     """
 
     name = "mlp"
@@ -205,7 +216,10 @@ class MLP:
         Args:
             hidden (int): Width of the hidden layer. Kept small by default,
                 since the number of accessions is in the hundreds.
-            steps (int): Number of full-batch optimiser steps per fit.
+            steps (int or Sequence[int]): Number of full-batch optimiser
+                steps per fit. A sequence, for example ``(800, 1400, 2000)``,
+                trains once up to its largest value and lets :meth:`fit_path`
+                score the model at every value on the way.
             lr (float): AdamW learning rate.
             dropout (float): Dropout probability on the hidden activations.
             weight_decay (float): AdamW decoupled weight decay, applied to the
@@ -226,7 +240,8 @@ class MLP:
                 spawn a full thread pool and thrash.
         """
         self.hidden = hidden
-        self.steps = steps
+        self.checkpoints = tuple(sorted({int(s) for s in np.atleast_1d(steps)}))
+        self.steps = self.checkpoints[-1]
         self.lr = lr
         self.dropout = dropout
         self.weight_decay = weight_decay
@@ -235,7 +250,8 @@ class MLP:
         self.deterministic = deterministic
         self.threads = threads
 
-        self.meta = {"clf_hidden": hidden, "clf_steps": steps, "clf_lr": lr,
+        self.meta = {"clf_hidden": hidden, "clf_steps": self.steps,
+                     "clf_lr": lr,
                      "clf_dropout": dropout, "clf_weight_decay": weight_decay,
                      "clf_seed": seed}
 
@@ -256,8 +272,38 @@ class MLP:
             return []
         return [dev.index if dev.index is not None else torch.cuda.current_device()]
 
-    def fit(self, X, y):
-        """Train the perceptron on one training set.
+    def _rng_state(self, dev):
+        """Capture the RNG state that training draws from.
+
+        Args:
+            dev (torch.device): Device the work runs on.
+
+        Returns:
+            tuple: The CPU generator state and the states of the devices listed
+            by :meth:`_fork_devices`.
+        """
+        return (torch.get_rng_state(),
+                [torch.cuda.get_rng_state(d) for d in self._fork_devices(dev)])
+
+    def _set_rng_state(self, dev, state):
+        """Restore a state captured by :meth:`_rng_state`.
+
+        Args:
+            dev (torch.device): Device the work runs on.
+            state (tuple): Output of :meth:`_rng_state`.
+        """
+        cpu, cuda = state
+        torch.set_rng_state(cpu)
+        for d, st in zip(self._fork_devices(dev), cuda):
+            torch.cuda.set_rng_state(st, d)
+
+    def _setup(self, X, y):
+        """Standardise, initialise the network and build the optimiser.
+
+        Nothing is trained yet. The training state is kept on the instance so
+        that :meth:`_advance` can continue from it, and the RNG state right
+        after initialisation is recorded, which is exactly where a one-shot fit
+        would take its first step.
 
         Class imbalance is handled with a positive-class weight computed from
         `y` alone, which is the ratio ``class_weight="balanced"`` gives the
@@ -267,9 +313,6 @@ class MLP:
         Args:
             X (numpy.ndarray): Training features of shape (n_train, D).
             y (numpy.ndarray): Binary training labels.
-
-        Returns:
-            MLP: self, with `scaler_` and `net_` populated.
 
         Raises:
             RuntimeError: If deterministic execution is requested on CUDA
@@ -290,15 +333,14 @@ class MLP:
 
         wd = self.weight_decay
 
-        Xt = torch.as_tensor(Xs, device=dev)
-        yt = torch.as_tensor(y, dtype=torch.float32, device=dev)
+        self.Xt_ = torch.as_tensor(Xs, device=dev)
+        self.yt_ = torch.as_tensor(y, dtype=torch.float32, device=dev)
 
         prev_threads = torch.get_num_threads()
         torch.set_num_threads(self.threads)
         try:
-            # the fork covers the whole fit, not just the initialisation, so
-            # that dropout draws are reproducible too and the surrounding RNG
-            # state is left exactly as it was found
+            # forked so that the surrounding RNG state is left exactly as it
+            # was found; the state reached inside is carried to _advance
             with torch.random.fork_rng(devices=self._fork_devices(dev)):
                 torch.manual_seed(self.seed)
                 net = _MLPNet(Xs.shape[1], self.hidden, self.dropout).to(dev)
@@ -307,26 +349,106 @@ class MLP:
                 decay, no_decay = [], []
                 for pname, p in net.named_parameters():
                     (no_decay if pname.endswith("bias") else decay).append(p)
-                opt = torch.optim.AdamW(
+                self.opt_ = torch.optim.AdamW(
                     [{"params": decay, "weight_decay": wd},
                      {"params": no_decay, "weight_decay": 0.0}],
                     lr=self.lr)
-                loss_fn = nn.BCEWithLogitsLoss(
+                self.loss_fn_ = nn.BCEWithLogitsLoss(
                     pos_weight=torch.tensor([pw], dtype=torch.float32,
                                             device=dev))
-
-                with _deterministic(self.deterministic):
-                    net.train()
-                    for _ in range(self.steps):
-                        opt.zero_grad()
-                        loss = loss_fn(net(Xt), yt)
-                        loss.backward()
-                        opt.step()
-            net.eval()
-            self.net_ = net
+                self.rng_ = self._rng_state(dev)
         finally:
             torch.set_num_threads(prev_threads)
+        net.eval()
+        self.net_ = net
+        self.step_ = 0
+
+    def _advance(self, target):
+        """Continue training from the current step up to `target`.
+
+        The optimiser keeps its moments and step count between calls, and the
+        RNG is resumed from where the previous call left it, so dropout draws
+        continue the same stream. Training in several calls therefore gives
+        exactly the model a single call to the final step would.
+
+        Args:
+            target (int): Total number of steps to have been taken on return.
+        """
+        dev = torch.device(self.device)
+        prev_threads = torch.get_num_threads()
+        torch.set_num_threads(self.threads)
+        try:
+            with torch.random.fork_rng(devices=self._fork_devices(dev)):
+                self._set_rng_state(dev, self.rng_)
+                with _deterministic(self.deterministic):
+                    self.net_.train()
+                    for _ in range(target - self.step_):
+                        self.opt_.zero_grad()
+                        loss = self.loss_fn_(self.net_(self.Xt_), self.yt_)
+                        loss.backward()
+                        self.opt_.step()
+                self.rng_ = self._rng_state(dev)
+            self.net_.eval()
+            self.step_ = target
+        finally:
+            torch.set_num_threads(prev_threads)
+
+    def _release(self):
+        """Drop the training state, keeping only what scoring needs."""
+        self.Xt_ = self.yt_ = self.opt_ = self.loss_fn_ = self.rng_ = None
+
+    def fit(self, X, y):
+        """Train the perceptron on one training set for `steps` steps.
+
+        When `steps` was given as a sequence this trains up to its largest
+        value; use :meth:`fit_path` to score the intermediate ones.
+
+        Args:
+            X (numpy.ndarray): Training features of shape (n_train, D).
+            y (numpy.ndarray): Binary training labels.
+
+        Returns:
+            MLP: self, with `scaler_` and `net_` populated.
+
+        Raises:
+            RuntimeError: If deterministic execution is requested on CUDA
+                without CUBLAS_WORKSPACE_CONFIG having been set.
+        """
+        self._setup(X, y)
+        self._advance(self.steps)
+        self._release()
         return self
+
+    def fit_path(self, X, y):
+        """Train once up to the largest checkpoint, pausing at every one.
+
+        Typical use scores held-out rows at every checkpoint::
+
+            for step, m in MLP(steps=(800, 1400, 2000)).fit_path(Xtr, ytr):
+                scores[step] = m.decision_function(Xte)
+
+        Scoring between checkpoints draws no random numbers and does not touch
+        the training state, so it leaves the remaining path unchanged.
+
+        Args:
+            X (numpy.ndarray): Training features of shape (n_train, D).
+            y (numpy.ndarray): Binary training labels.
+
+        Yields:
+            tuple: ``(step, self)`` at each entry of `checkpoints`, in
+            increasing order, with `net_` holding the model after `step` steps.
+
+        Raises:
+            RuntimeError: If deterministic execution is requested on CUDA
+                without CUBLAS_WORKSPACE_CONFIG having been set.
+        """
+        self._setup(X, y)
+        try:
+            for step in self.checkpoints:
+                self._advance(step)
+                yield step, self
+        finally:
+            self._release()
 
     def decision_function(self, X):
         """Score rows with the fitted perceptron.

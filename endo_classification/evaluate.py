@@ -167,6 +167,57 @@ def _clf(C, classifier="logreg", clf_kw=None):
     return make_classifier(C, classifier, clf_kw)
 
 
+def _clf_kws(clf_kw):
+    """Normalise `clf_kw` to a list of settings.
+
+    Args:
+        clf_kw (dict or Sequence[dict], optional): One setting, or several.
+
+    Returns:
+        list: The settings, a single dict (or None) becoming a one-item list.
+    """
+    return list(clf_kw) if isinstance(clf_kw, (list, tuple)) else [clf_kw]
+
+
+def _path_metas(clf):
+    """List the `meta` of every model :func:`_fit_path` will yield for `clf`.
+
+    Args:
+        clf (LogReg or MLP): Classifier, fitted or not.
+
+    Returns:
+        list[dict]: One `meta` per checkpoint, with "clf_steps" set to that
+        checkpoint, or the classifier's own `meta` alone if it has no
+        checkpoints.
+    """
+    if not hasattr(clf, "fit_path"):
+        return [clf.meta]
+    return [{**clf.meta, "clf_steps": st} for st in clf.checkpoints]
+
+
+def _fit_path(clf, Xtr, ytr):
+    """Fit a classifier, yielding the model at each of its checkpoints.
+
+    A classifier exposing `fit_path` is trained once up to its last checkpoint
+    and handed back at every one on the way; any other is fitted once.
+
+    Args:
+        clf (LogReg or MLP): Unfitted classifier.
+        Xtr (numpy.ndarray): Training features of shape (n_train, D).
+        ytr (numpy.ndarray): Training labels.
+
+    Yields:
+        tuple: ``(meta, model)``, `meta` matching :func:`_path_metas` in
+        order. The model must be scored before the next item is requested,
+        since training continues in place.
+    """
+    if not hasattr(clf, "fit_path"):
+        yield clf.meta, clf.fit(Xtr, ytr)
+        return
+    for meta, (_, m) in zip(_path_metas(clf), clf.fit_path(Xtr, ytr)):
+        yield meta, m
+
+
 def _metric_value(y_true, scores, metric):
     """Evaluate one metric from labels and decision function values.
 
@@ -200,6 +251,8 @@ def _metric_value(y_true, scores, metric):
 def _fit_eval(Xtr, ytr, Xte, yte, clf):
     """Fit the classifier on one training set and score one test set.
 
+    A classifier with several checkpoints is scored at each of them.
+
     Args:
         Xtr (numpy.ndarray): Training features of shape (n_train, D).
         ytr (numpy.ndarray): Training labels.
@@ -208,17 +261,22 @@ def _fit_eval(Xtr, ytr, Xte, yte, clf):
         clf (LogReg or MLP): Unfitted classifier, fitted here and discarded.
 
     Returns:
-        dict: Metrics and counts for one fit. AUROC and AUPRC are computed on
+        list[tuple]: One ``(meta, metrics)`` per checkpoint, `meta` being the
+        classifier's `meta` at that checkpoint and `metrics` a dict of metrics
+        and counts for that model. AUROC and AUPRC are computed on
         the raw decision function, so they depend only on the ranking; balanced
         accuracy thresholds it at zero and therefore also depends on the
         intercept. "prevalence" is the positive rate of the test set, which is
         the chance level for AUPRC.
     """
-    p = clf.fit(Xtr, ytr)
-    s = p.decision_function(Xte)
-    return {**{m: _metric_value(yte, s, m) for m in METRICS},
-            "prevalence": float(yte.mean()),
-            "n_train": len(ytr), "n_test": len(yte), "n_pos_test": int(yte.sum())}
+    out = []
+    for meta, p in _fit_path(clf, Xtr, ytr):
+        s = p.decision_function(Xte)
+        out.append((meta, {**{m: _metric_value(yte, s, m) for m in METRICS},
+                           "prevalence": float(yte.mean()),
+                           "n_train": len(ytr), "n_test": len(yte),
+                           "n_pos_test": int(yte.sum())}))
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -251,10 +309,13 @@ def run_grid(rep, labels, splits, Cs=(C_HEADLINE,), conditions=CONDITIONS,
             bar across several representations. No progress is reported when
             None.
         classifier (str): One of :data:`~.classifiers.CLASSIFIERS`.
-        clf_kw (dict, optional): Extra hyperparameters for that classifier.
+        clf_kw (dict or Sequence[dict], optional): Extra hyperparameters for
+            that classifier, or a list of settings to evaluate on the same
+            representation fits. See :func:`run_inner`.
 
     Returns:
-        pandas.DataFrame: One row per (split, condition, C), carrying
+        pandas.DataFrame: One row per (split, condition, C, setting,
+        checkpoint), carrying
         "representation", "seed", "condition", "C" (NaN for the perceptron,
         which does not use it), "classifier", the entries of
         ``rep.meta`` and of the classifier's `meta`, and the metrics returned by
@@ -276,15 +337,18 @@ def run_grid(rep, labels, splits, Cs=(C_HEADLINE,), conditions=CONDITIONS,
                 r = rep.clone().fit(atr, ytr)
                 Xtr, Xte = r.transform(atr), r.transform(ate)
                 for C in Cs:
-                    # a fresh classifier per (split, condition, C): nothing is
-                    # carried over between fits
-                    clf = _clf(C, classifier, clf_kw)
-                    rows.append({"representation": rep.name, "seed": sp["seed"],
-                                 "condition": c,
-                                 "C": float(C) if classifier == "logreg" else np.nan,
-                                 "classifier": clf.name,
-                                 **rep.meta, **clf.meta,
-                                 **_fit_eval(Xtr, ytr, Xte, yte, clf)})
+                    for kw in _clf_kws(clf_kw):
+                        # a fresh classifier per (split, condition, C,
+                        # setting): nothing is carried over between fits
+                        clf = _clf(C, classifier, kw)
+                        for meta, m in _fit_eval(Xtr, ytr, Xte, yte, clf):
+                            rows.append({
+                                "representation": rep.name, "seed": sp["seed"],
+                                "condition": c,
+                                "C": (float(C) if classifier == "logreg"
+                                      else np.nan),
+                                "classifier": clf.name,
+                                **rep.meta, **meta, **m})
             if pbar is not None:
                 pbar.update(1)
     return pd.DataFrame(rows)
@@ -308,7 +372,8 @@ def run_many(reps, labels, splits, Cs=(C_HEADLINE,), conditions=CONDITIONS,
         progress (bool): Whether to display the progress bar. Set to False when
             this function is itself called inside a loop.
         classifier (str): One of :data:`~.classifiers.CLASSIFIERS`.
-        clf_kw (dict, optional): Extra hyperparameters for that classifier.
+        clf_kw (dict or Sequence[dict], optional): Extra hyperparameters for
+            that classifier, or a list of settings. See :func:`run_inner`.
 
     Returns:
         pandas.DataFrame: The concatenation of each representation's grid.
@@ -825,11 +890,17 @@ def inner_cv_scores(rep, labels, split, cond, C=C_HEADLINE, k=5,
             classifier that needs a seed of its own carries it in `clf_kw` and
             holds it fixed across folds.
         classifier (str): One of :data:`~.classifiers.CLASSIFIERS`.
-        clf_kw (dict, optional): Extra hyperparameters for that classifier.
+        clf_kw (dict or Sequence[dict], optional): Extra hyperparameters for
+            that classifier, or a list of settings. Every setting is trained on
+            the same folds and the same representation fit, which is fitted
+            once per fold whatever the number of settings. A setting whose
+            `steps` is a sequence is trained once and scored at every value.
 
     Returns:
-        list[dict]: One entry per repeat with keys "repeat", "auroc", "auprc",
-        "bacc", "prevalence", "n_oof" and "n_pos". The three metrics are NaN
+        list[dict]: One entry per (repeat, setting, checkpoint) with the
+        classifier's `meta` at that checkpoint (empty for the logistic probe)
+        followed by the keys "repeat", "auroc", "auprc", "bacc", "prevalence",
+        "n_oof" and "n_pos". The three metrics are NaN
         when the folds could not be built or when the pooled out-of-fold labels
         are single-class. "prevalence" is the positive rate of the pooled
         out-of-fold labels, which is the chance level for AUPRC.
@@ -846,40 +917,50 @@ def inner_cv_scores(rep, labels, split, cond, C=C_HEADLINE, k=5,
         correspondingly less stable here than on a single fitted model.
     """
     acc, y, groups = _train_acc(labels, rep, split, cond)
+    kws = _clf_kws(clf_kw)
+    # one result slot per (setting, checkpoint), in the order they are
+    # reported; scores are pooled across folds separately for each slot
+    metas = [mt for kw in kws for mt in _path_metas(_clf(C, classifier, kw))]
+    empty = {"auroc": np.nan, "auprc": np.nan, "bacc": np.nan,
+             "prevalence": np.nan, "n_oof": 0, "n_pos": 0}
     out = []
     for r in range(n_repeats):
         rs = _derive_seed(cond, rep.name, int(split["seed"]), r, seed)
         cv = StratifiedGroupKFold(n_splits=k, shuffle=True, random_state=rs)
-        s_all, y_all = [], []
+        s_all, y_all = [[] for _ in metas], []
         try:
             folds = list(cv.split(acc, y, groups))
         except ValueError:
-            out.append({"repeat": r, "auroc": np.nan, "auprc": np.nan,
-                        "bacc": np.nan, "prevalence": np.nan,
-                        "n_oof": 0, "n_pos": 0})
+            out.extend({**mt, "repeat": r, **empty} for mt in metas)
             continue
         for itr, iva in folds:
             if len(np.unique(y[itr])) < 2:      # cannot fit on one class
                 continue
             rr = rep.clone().fit(acc[itr], y[itr])   # refit inside the fold
-            p = _clf(C, classifier, clf_kw).fit(rr.transform(acc[itr]), y[itr])
-            s_all.append(p.decision_function(rr.transform(acc[iva])))
+            Xtr, Xva = rr.transform(acc[itr]), rr.transform(acc[iva])
+            # every setting is trained on the same representation fit, and a
+            # setting with several checkpoints is trained once along them
+            slot = 0
+            for kw in kws:
+                for _, p in _fit_path(_clf(C, classifier, kw), Xtr, y[itr]):
+                    s_all[slot].append(p.decision_function(Xva))
+                    slot += 1
             y_all.append(y[iva])
-        if not s_all:
-            out.append({"repeat": r, "auroc": np.nan, "auprc": np.nan,
-                        "bacc": np.nan, "prevalence": np.nan,
-                        "n_oof": 0, "n_pos": 0})
+        if not y_all:
+            out.extend({**mt, "repeat": r, **empty} for mt in metas)
             continue
-        s_all = np.concatenate(s_all)
         y_all = np.concatenate(y_all)
-        # the same metrics run_grid reports, computed once over the pooled
-        # out-of-fold scores rather than averaged over the folds
-        if len(np.unique(y_all)) == 2:
-            m = {k: _metric_value(y_all, s_all, k) for k in METRICS}
-        else:
-            m = {k: np.nan for k in METRICS}
-        out.append({"repeat": r, **m, "prevalence": float(y_all.mean()),
-                    "n_oof": len(y_all), "n_pos": int(y_all.sum())})
+        for mt, s in zip(metas, s_all):
+            s = np.concatenate(s)
+            # the same metrics run_grid reports, computed once over the pooled
+            # out-of-fold scores rather than averaged over the folds
+            if len(np.unique(y_all)) == 2:
+                m = {k: _metric_value(y_all, s, k) for k in METRICS}
+            else:
+                m = {k: np.nan for k in METRICS}
+            out.append({**mt, "repeat": r, **m,
+                        "prevalence": float(y_all.mean()),
+                        "n_oof": len(y_all), "n_pos": int(y_all.sum())})
     return out
 
 
@@ -903,19 +984,27 @@ def run_inner(reps, labels, splits, conditions=CONDITIONS, C=C_HEADLINE,
         n_repeats (int): Number of times the fold assignment is redrawn.
         seed (int): Base seed for the fold assignments.
         classifier (str): One of :data:`~.classifiers.CLASSIFIERS`.
-        clf_kw (dict, optional): Extra hyperparameters for that classifier. To
-            tune one, call this once per setting and concatenate, then group on
-            the corresponding "clf_" column::
+        clf_kw (dict or Sequence[dict], optional): Extra hyperparameters for
+            that classifier, or a list of settings to tune over. A list is
+            evaluated in one pass: each inner fold fits the representation
+            once and trains every setting on it, rather than refitting the
+            representation per setting as separate calls would. For the
+            perceptron, `steps` may itself be a sequence, which trains once up
+            to its largest value and scores every value on the way. Group on
+            the "clf_" columns afterwards::
 
-                inner = pd.concat([run_inner(reps, labels, splits,
-                                             classifier="mlp",
-                                             clf_kw={"steps": s})
-                                   for s in (100, 300, 1000)])
-                summarise_inner(inner,
-                                by=("representation", "condition", "clf_steps"))
+                inner = run_inner(reps, labels, splits, classifier="mlp",
+                                  clf_kw=[{"hidden": h, "steps": (800, 2000)}
+                                          for h in (8, 16, 32)])
+                summarise_inner(inner, by=("representation", "condition",
+                                           "clf_hidden", "clf_steps"))
+
+            The result matches concatenating separate calls, one per setting
+            and step count, up to row order.
         n_jobs (int): Number of parallel workers, passed to joblib. Each task is
             one (representation, split, condition), which is the coarsest unit
-            that stays independent, so the grain is `n_repeats * k` fits. One by
+            that stays independent, so the grain is `n_repeats * k` fits per
+            setting. One by
             default, which keeps the serial path exactly as it was.
 
             Parallelising here rather than inside a fit is deliberate: the
@@ -926,14 +1015,15 @@ def run_inner(reps, labels, splits, conditions=CONDITIONS, C=C_HEADLINE,
 
     Returns:
         pandas.DataFrame: One row per (representation, condition, outer split,
-        repeat), carrying "representation", "condition", "split_seed",
-        "classifier", the entries of ``rep.meta`` and of the classifier's
-        `meta`, and the fields returned by :func:`inner_cv_scores`.
+        repeat, setting, checkpoint), carrying "representation", "condition",
+        "split_seed", "classifier", the entries of ``rep.meta`` and of the
+        classifier's `meta` at that checkpoint, and the fields returned by
+        :func:`inner_cv_scores`.
     """
     reps = reps if isinstance(reps, (list, tuple)) else [reps]
-    # built once purely to read its name and hyperparameters into every row;
-    # the fits below each construct their own
-    template = _clf(C, classifier, clf_kw)
+    # built once per setting, so that a bad clf_kw fails here rather than
+    # inside a worker; the first also supplies the classifier name for the rows
+    template = [_clf(C, classifier, kw) for kw in _clf_kws(clf_kw)][0]
 
     splits = list(splits)
     conditions = list(conditions)
@@ -978,7 +1068,6 @@ def run_inner(reps, labels, splits, conditions=CONDITIONS, C=C_HEADLINE,
                 "split_seed": sp["seed"],
                 "classifier": template.name,
                 **rep.meta,
-                **template.meta,
                 **d,
             })
 
