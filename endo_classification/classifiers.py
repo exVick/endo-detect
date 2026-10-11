@@ -21,7 +21,7 @@ Selecting a classifier
 
 Every entry point of :mod:`evaluate` takes ``classifier`` and ``clf_kw``::
 
-    run_inner(reps, labels, splits)                       # logistic, unchanged
+    run_inner(reps, labels, splits)
     run_inner(reps, labels, splits, classifier="mlp")
     run_inner(reps, labels, splits, classifier="mlp",
               clf_kw={"hidden": 32, "steps": 600, "weight_decay": 1e-2})
@@ -209,7 +209,7 @@ class MLP:
     name = "mlp"
 
     def __init__(self, hidden=16, steps=300, lr=1e-3, dropout=0.0,
-                 weight_decay=1e-2, seed=0, device="cpu", deterministic=True,
+                 weight_decay=0.1, seed=0, device="cpu", deterministic=True,
                  threads=1):
         """Record the hyperparameters. Nothing is fitted yet.
 
