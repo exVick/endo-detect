@@ -965,7 +965,7 @@ def inner_cv_scores(rep, labels, split, cond, C=C_HEADLINE, k=5,
 
 
 def run_inner(reps, labels, splits, conditions=CONDITIONS, C=C_HEADLINE,
-              k=5, n_repeats=10, seed=0, classifier="logreg", clf_kw=None,
+              k=5, n_repeats=3, seed=0, classifier="logreg", clf_kw=None,
               n_jobs=1):
     """Run :func:`inner_cv_scores` across representations, splits and conditions.
 
